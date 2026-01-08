@@ -1,0 +1,121 @@
+adi@macbook-pro-4 nanoJEPA % uv run python -m nanojepa.generate --run big-jepa-brain --model-file probed_model.pt --text "The monster"
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:279: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+
+Loading runs/big-jepa-brain/probed_model.pt...
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+
+  warnings.warn(
+
+
+
+Prompt: The monster
+
+Thinking... (Predicted Vector Norm: 17.05)
+
+----------------------------------------
+
+Prediction:  were in with for like full of. you I Ann answered from whenever on, and looked even is�!" here. sugar. in it there like outside later. on and down so to said at in under hard, of like better is down who
+
+----------------------------------------
+
+adi@macbook-pro-4 nanoJEPA % uv run python -m nanojepa.generate --run big-jepa-brain --model-file probed_model.pt --text "The little boy"       
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:279: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+
+Loading runs/big-jepa-brain/probed_model.pt...
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+
+  warnings.warn(
+
+
+
+Prompt: The little boy
+
+Thinking... (Predicted Vector Norm: 17.06)
+
+----------------------------------------
+
+Prediction:  in. even here is." there!" like of he later and down ons!"� and I whenever together up like you with a. Ann, it aloney so. to better looked for outside that in anymore later happy full safe on is.
+
+----------------------------------------
+
+adi@macbook-pro-4 nanoJEPA % uv run python -m nanojepa.generate --run big-jepa-brain --model-file probed_model.pt --text "The scary man"
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:279: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+
+Loading runs/big-jepa-brain/probed_model.pt...
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+
+  warnings.warn(
+
+
+
+Prompt: The scary man
+
+Thinking... (Predicted Vector Norm: 17.06)
+
+----------------------------------------
+
+Prediction: .!"?" later in you and here like is with on of with here the on." it like like looked answered we even so for later and there,, I like, with later like sugar here at later even Ann like happy. and� better
+
+----------------------------------------
+
+adi@macbook-pro-4 nanoJEPA % uv run python -m nanojepa.generate --run big-jepa-brain --model-file probed_model.pt --text "The little girl"
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:279: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+
+Loading runs/big-jepa-brain/probed_model.pt...
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+
+  warnings.warn(
+
+
+
+Prompt: The little girl
+
+Thinking... (Predicted Vector Norm: 17.05)
+
+----------------------------------------
+
+Prediction: . like like on and you even with,. from Ann is in down we later for like?" the well there. with later tos with here. he!".. it whenever so and of you your you there safe. is like like like
+
+----------------------------------------
+
+adi@macbook-pro-4 nanoJEPA % uv run python -m nanojepa.generate --run big-jepa-brain --model-file probed_model.pt --text "The mother"     
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:279: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+
+Loading runs/big-jepa-brain/probed_model.pt...
+
+/Users/adi/projects/nanoJEPA/.venv/lib/python3.12/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+
+  warnings.warn(
+
+
+
+Prompt: The mother
+
+Thinking... (Predicted Vector Norm: 17.05)
+
+----------------------------------------
+
+Prediction:  like on.!" from of in and and, with here like you there." later full Ann the he up. like like alone down for and in outside so I. better for like want at likey of in looked. is this happy Tim you
+
+----------------------------------------
+
+what do you make of this
