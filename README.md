@@ -1,4 +1,4 @@
-# NanoJEPA
+# NanoJEPA 
 
 A tiny implementation of a Joint-Embedding Predictive Architecture (JEPA) for text, inspired by LeCun's vision.
 
