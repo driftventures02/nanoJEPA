@@ -1,4 +1,20 @@
-"""Training script for NanoJEPA encoder-predictor on TinyStories."""
+"""
+Stage 1: Train the JEPA "Brain" (Encoder + Predictor)
+
+This script trains the representation learning components of NanoJEPA.
+The decoder is disabled - we only train the encoder to predict future
+abstract representations, not words.
+
+After training, run train_probe.py (Stage 2) to teach a decoder to
+translate these representations into text.
+
+Usage:
+    uv run python -m nanojepa.train \
+        --run-name my-jepa-brain \
+        --max-samples 32000 \
+        --epochs 3 \
+        --ema-decay 0.996
+"""
 
 import argparse
 import csv
@@ -14,12 +30,11 @@ from .model import NanoJEPA, JEPAConfig
 from .data import get_dataloaders
 
 
-# Global tokenizer for decoding samples
 TOKENIZER = tiktoken.get_encoding("gpt2")
 
 
 def get_device() -> torch.device:
-    """Get the best available device."""
+    """Get the best available device (MPS > CUDA > CPU)."""
     if torch.backends.mps.is_available():
         return torch.device("mps")
     elif torch.cuda.is_available():
@@ -28,12 +43,17 @@ def get_device() -> torch.device:
 
 
 def count_parameters(model: torch.nn.Module) -> int:
-    """Count trainable parameters."""
+    """Count trainable parameters in the model."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def get_gradient_norms(model: torch.nn.Module) -> dict:
-    """Get gradient norms for key components."""
+    """
+    Get gradient norms for key components.
+    
+    Useful for debugging training - if norms explode, increase grad_clip.
+    If norms vanish, learning rate might be too low.
+    """
     norms = {}
     for name, param in model.named_parameters():
         if param.grad is not None:
@@ -54,8 +74,17 @@ def get_gradient_norms(model: torch.nn.Module) -> dict:
 
 def debug_brain(model, device, prompt="Once upon a time"):
     """
-    Sanity check for the Brain (JEPA).
-    Prints vector stats to ensure no collapse (all zeros) or explosion.
+    Print vector statistics for debugging.
+    
+    Healthy signs:
+        - Norm: ~15-20 (with LayerNorm)
+        - Std: ~1.0
+        - Values spread across positive and negative
+    
+    Bad signs:
+        - Norm → 0: Collapse
+        - Norm → 100+: Exploding (need more grad_clip or LayerNorm)
+        - All values identical: Collapse
     """
     model.eval()
     try:
@@ -70,14 +99,12 @@ def debug_brain(model, device, prompt="Once upon a time"):
             print("[BRAIN DEBUG]")
             print(f"Input Text: '{prompt}'")
             
-            # Print Stats
             for name, vec in [("Encoded (z)", z), ("Predicted (z_pred)", z_pred)]:
-                v = vec[0] # Take first item in batch
+                v = vec[0]  # First item in batch
                 print(f"\n{name}:")
                 print(f"  Norm: {v.norm().item():.4f}")
                 print(f"  Mean: {v.mean().item():.4f} | Std: {v.std().item():.4f}")
                 print(f"  Min:  {v.min().item():.4f} | Max: {v.max().item():.4f}")
-                # Print first 5 values formatted nicely
                 vals = ", ".join([f"{x:.3f}" for x in v[:5].tolist()])
                 print(f"  Sample: [{vals}, ...]")
             print("="*40 + "\n")
@@ -89,7 +116,7 @@ def debug_brain(model, device, prompt="Once upon a time"):
 
 
 class Logger:
-    """Simple CSV + console logger."""
+    """Simple CSV + console logger for training metrics."""
 
     def __init__(self, log_dir: Path, run_name: str):
         self.log_dir = log_dir
@@ -103,13 +130,13 @@ class Logger:
         self.step = 0
 
     def log_config(self, config: dict):
-        """Save config to JSON."""
+        """Save config to JSON for reproducibility."""
         with open(self.config_path, "w") as f:
             json.dump(config, f, indent=2)
         print(f"Config saved to {self.config_path}")
 
     def log(self, metrics: dict):
-        """Log metrics to CSV."""
+        """Log metrics to CSV file."""
         metrics["step"] = self.step
 
         if self.csv_writer is None:
@@ -149,7 +176,14 @@ def evaluate(model: NanoJEPA, val_loader, device: torch.device) -> dict:
 
 
 def train(config: dict):
-    """Main training loop."""
+    """
+    Main training loop for the JEPA brain.
+    
+    Key components:
+        1. OneCycleLR scheduler with warmup (prevents cold start explosion)
+        2. Gradient clipping (prevents training instability)
+        3. EMA teacher updates (prevents representation collapse)
+    """
     device = get_device()
     print(f"Using device: {device}")
 
@@ -159,7 +193,7 @@ def train(config: dict):
     logger = Logger(log_dir, run_name)
     logger.log_config(config)
 
-    # Create model
+    # Create model (encoder_only=True for brain-only training)
     model_config = JEPAConfig(
         vocab_size=config["vocab_size"],
         embed_dim=config["embed_dim"],
@@ -168,14 +202,14 @@ def train(config: dict):
         pred_depth=config["pred_depth"],
         block_size=config["block_size"],
         dropout=config["dropout"],
-        encoder_only=True, # Always train brain-only in this script
+        encoder_only=True,
     )
     model = NanoJEPA(model_config).to(device)
 
     n_params = count_parameters(model)
     print(f"Model parameters: {n_params:,}")
 
-    # Get data
+    # Load data
     train_loader, val_loader = get_dataloaders(
         block_size=config["block_size"],
         batch_size=config["batch_size"],
@@ -192,17 +226,17 @@ def train(config: dict):
         weight_decay=config["weight_decay"],
     )
 
-    # Learning rate scheduler: OneCycleLR (Warmup + Decay)
-    # This prevents the "Cold Start" explosion.
+    # Learning rate scheduler: OneCycleLR
+    # Includes warmup (30% of training) to prevent cold start explosion which I experienced
+    # Then anneals down to near-zero for stable convergence
     total_steps = config["epochs"] * len(train_loader)
-    
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config["learning_rate"],
         total_steps=total_steps,
-        pct_start=0.3,   # Spend first 30% of time warming up
-        div_factor=25,   # Start at lr / 25
-        final_div_factor=1000 # End at almost zero
+        pct_start=0.3,          # Warmup for first 30%
+        div_factor=25,          # Start at lr/25
+        final_div_factor=1000   # End at almost zero
     )
 
     # Training loop
@@ -212,7 +246,6 @@ def train(config: dict):
     for epoch in range(config["epochs"]):
         model.train()
         epoch_loss = 0.0
-        epoch_latent_loss = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config['epochs']}")
         for batch_idx, (context, target) in enumerate(pbar):
@@ -226,23 +259,23 @@ def train(config: dict):
             optimizer.zero_grad()
             loss.backward()
 
-            # Get gradient norms before clipping
+            # Get gradient norms before clipping (for debugging)
             grad_norms = get_gradient_norms(model)
 
-            # Gradient clipping
+            # Gradient clipping (prevents instability)
             if config["grad_clip"] > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
 
             optimizer.step()
             
-            # CRITICAL: Update the Ghost Teacher
+            # CRITICAL: Update the Ghost Teacher via EMA
             model.update_teacher(decay=config["ema_decay"])
             
+            # Step the scheduler
             scheduler.step()
 
             # Logging
             epoch_loss += loss.item()
-            epoch_latent_loss += losses["latent_loss"].item()
 
             if global_step % config["log_interval"] == 0:
                 logger.log({
@@ -256,7 +289,7 @@ def train(config: dict):
                     **grad_norms,
                 })
 
-            # Print sample every N steps
+            # Print debug info periodically
             if global_step % config["sample_interval"] == 0:
                 debug_brain(model, device)
                 print(f"  cosine_sim={losses['cosine_sim'].item():.4f}, "
@@ -274,7 +307,6 @@ def train(config: dict):
 
         # Epoch summary
         avg_epoch_loss = epoch_loss / len(train_loader)
-        # avg_epoch_latent = epoch_latent_loss / len(train_loader) # Unused
 
         # Validation
         val_metrics = evaluate(model, val_loader, device)
@@ -305,33 +337,44 @@ def train(config: dict):
     logger.close()
     print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
     print(f"Logs: {log_dir}")
+    print(f"\nNext step: Train the decoder probe:")
+    print(f"  uv run python -m nanojepa.train_probe --run {run_name}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train NanoJEPA")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--block-size", type=int, default=128, help="Sequence block size")
-    parser.add_argument("--stride", type=int, default=64, help="Stride between samples")
-    parser.add_argument("--embed-dim", type=int, default=256, help="Embedding dimension")
-    parser.add_argument("--enc-layers", type=int, default=4, help="Encoder layers")
-    parser.add_argument("--enc-heads", type=int, default=4, help="Encoder attention heads")
-    parser.add_argument("--pred-depth", type=int, default=2, help="Predictor MLP depth")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--grad-clip", type=float, default=0.5, help="Gradient clipping")
-    parser.add_argument("--log-interval", type=int, default=10, help="Log every N steps")
-    parser.add_argument("--sample-interval", type=int, default=100, help="Print sample every N steps")
-    parser.add_argument("--run-name", type=str, default=None, help="Run name for logs")
-    parser.add_argument("--subset-ratio", type=float, default=0.1, help="Ratio of TinyStories to use (0.0-1.0)")
-    parser.add_argument("--sentences-per-block", type=int, default=3, help="Number of sentences per context/target block")
-    parser.add_argument("--max-samples", type=int, default=None, help="Maximum number of samples to use (for quick testing)")
-    parser.add_argument("--ema-decay", type=float, default=0.996, help="EMA decay rate for teacher")
+    parser = argparse.ArgumentParser(description="Train NanoJEPA Brain (Stage 1)")
+    
+    # Training params
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--grad-clip", type=float, default=0.5)
+    parser.add_argument("--ema-decay", type=float, default=0.996)
+    
+    # Model architecture
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--embed-dim", type=int, default=256)
+    parser.add_argument("--enc-layers", type=int, default=4)
+    parser.add_argument("--enc-heads", type=int, default=4)
+    parser.add_argument("--pred-depth", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    
+    # Data params
+    parser.add_argument("--stride", type=int, default=64)
+    parser.add_argument("--subset-ratio", type=float, default=0.1)
+    parser.add_argument("--sentences-per-block", type=int, default=3)
+    parser.add_argument("--max-samples", type=int, default=None)
+    
+    # Logging
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--sample-interval", type=int, default=100)
+    parser.add_argument("--run-name", type=str, default=None)
+    
     args = parser.parse_args()
 
     config = {
-        "vocab_size": 50257,  # GPT-2 vocab
+        "vocab_size": 50257,
         "embed_dim": args.embed_dim,
         "enc_layers": args.enc_layers,
         "enc_heads": args.enc_heads,

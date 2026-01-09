@@ -2,7 +2,25 @@
 
 A minimal implementation of a **Joint-Embedding Predictive Architecture (JEPA)** for text, inspired by Yann LeCun's vision of self-supervised learning.
 
-Unlike traditional language models that predict tokens, JEPA learns to predict **abstract representations** (vectors) of future text. This forces the model to learn semantic meaning rather than surface-level patterns.
+---
+
+## 🎯 Why This Exists
+
+I believe Yann LeCun is right: **LLMs aren't the path forward**. 
+
+Current language models are incredibly capable pattern matchers, but they don't truly "understand" meaning. They predict the next token based on statistical patterns, not by building an internal model of the world (in high dimensional vector space). LeCun's JEPA architecture offers an alternative: learn to predict **abstract representations** rather than raw outputs. It also happens to be much faster with lower compute requirements than traditional LLMs.
+
+The core insight is that meaning should be captured in a way that works across modalities—text, images, video, audio. A sentence describing a red ball and an image of a red ball should share similar representations. JEPA attempts to learn these unified, semantic representations.
+
+### This Project
+
+I wanted to see if I could recreate Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) but as a JEPA version. This was built in one afternoon, so there's probably a lot wrong and a lot that could be changed but I decided to put it up anyway in case someone had a similar idea.
+
+**Important caveats:**
+- I didn't follow the findings and architecture in [LLM-JEPA](https://arxiv.org/abs/2410.10054) as that relies on adapting an existing LLM, I wanted to try building a purely representational version from scratch
+- Instead, I adapted concepts from [I-JEPA](https://arxiv.org/abs/2301.08243) and [V-JEPA](https://arxiv.org/abs/2404.15244) to fit text
+- I relied more on MLPs rather than Transformers for the predictor to keep things simple and trainable on my Macbook M4
+- The next time I have time, I'll try implementing a mini version of the LLM-JEPA architecture (without EMA, using dual representation double pass, basically training a LoRA on top of an existing model)
 
 ---
 
@@ -37,7 +55,7 @@ Unlike traditional language models that predict tokens, JEPA learns to predict *
 | Component | Purpose |
 |-----------|---------|
 | **Student Encoder** | Encodes context sentences → latent vector `z` |
-| **Teacher Encoder** | Encodes target sentences → stable target vector (EMA of student) |
+| **Teacher Encoder** | Encodes target sentences → stable target (EMA of student) |
 | **Predictor** | Transforms context vector → predicts target vector |
 | **Decoder** | (Stage 2) Translates vectors back to text |
 
@@ -53,6 +71,11 @@ nanojepa/
 ├── generate.py     # Text generation using trained model
 ├── data.py         # TinyStories data loading with sentence boundaries
 └── __init__.py
+
+# Utilities
+├── diagnose.py     # Verify if the model is actually learning
+├── test_generate.py # Comprehensive generation test suite
+└── README.md
 ```
 
 ---
@@ -99,6 +122,39 @@ uv run python -m nanojepa.generate \
     --model-file probed_model.pt \
     --text "The little girl"
 ```
+
+---
+
+## 🔬 Diagnostics & Testing
+
+### Diagnose Model Health
+
+Run comprehensive diagnostics to verify the model is actually learning:
+
+```bash
+uv run python diagnose.py --run big-jepa-brain
+```
+
+This tests:
+- **Vector Differentiation**: Do different prompts produce different vectors?
+- **Semantic Clustering**: Do similar prompts cluster together?
+- **Decoder Dependency**: Does the decoder actually use the JEPA vector?
+- **Vector Health**: Are norms and statistics reasonable?
+
+### Test Generation Quality
+
+Run multiple prompts through the model and analyze outputs:
+
+```bash
+uv run python test_generate.py --run big-jepa-brain --model-file probed_model.pt
+```
+
+This runs 18 different prompts and gives you:
+- `PASS`: Coherent output
+- `WARN`: Has issues (repetition, too short)
+- `FAIL`: Error occurred
+
+Add `--quiet` for summary only.
 
 ---
 
@@ -197,18 +253,6 @@ This provides stable targets and prevents collapse.
 | `latent_loss` | Decreasing | Stuck or increasing |
 | `repulsion_loss` | Near 0 (after warmup) | Always high |
 
-**Signs of collapse**:
-- `cosine_sim` = 1.0 (all vectors identical)
-- `z_hat_norm` = 0 (all zeros)
-- Loss immediately drops to 0
-
-### During Probe Training (Stage 2)
-
-| Metric | Good | Bad |
-|--------|------|-----|
-| `probe_loss` | 2.0 → 0.5 | Stuck at 5.0+ |
-| Debug generation | Coherent words | `....` or `and and and` |
-
 ### During Generation
 
 | Output | Diagnosis |
@@ -255,7 +299,7 @@ Full pipeline with probed decoder. Use for text generation.
 
 ---
 
-## 🐛 Common Issues
+## Common Issues
 
 ### "Vector norms exploding to 100+"
 
@@ -273,13 +317,29 @@ Posterior collapse. Increase word dropout or train longer.
 
 Lower temperature, increase repetition penalty, use Top-K sampling.
 
+### "Missing decoder keys when loading"
+
+You're loading `best_model.pt` (brain only) but need `probed_model.pt` (brain + decoder). Run `train_probe.py` first.
+
 ---
 
-## 📚 References
+## Future Work
+
+- Implement the actual [LLM-JEPA](https://arxiv.org/abs/2410.10054) architecture
+- Try dual representation with double pass (no EMA)
+- Train a LoRA adapter on top of an existing LLM instead of from scratch
+- Add block masking instead of next-chunk prediction
+- Experiment with sequence-to-sequence prediction (no pooling)
+
+---
+
+## References
 
 - [A Path Towards Autonomous AI](https://openreview.net/pdf?id=BZ5a1r-kVsf) - LeCun's JEPA paper
 - [I-JEPA](https://arxiv.org/abs/2301.08243) - Image JEPA
 - [V-JEPA](https://arxiv.org/abs/2404.15244) - Video JEPA
+- [LLM-JEPA](https://arxiv.org/abs/2410.10054) - JEPA for Language Models
+- [nanoGPT](https://github.com/karpathy/nanoGPT) - Karpathy's minimal GPT
 
 ---
 

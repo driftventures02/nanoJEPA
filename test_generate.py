@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
-Comprehensive test suite for NanoJEPA text generation.
+NanoJEPA Generation Test Suite
 
-Runs multiple prompts through the model and analyzes the outputs
-to determine if the model is actually learning something meaningful.
+Runs multiple prompts through the model and analyzes outputs to determine
+if the model is generating meaningful text.
 
 Usage:
-    uv run python test_generate.py --run big-jepa-brain --model-file probed_model.pt
+    uv run python test_generate.py --run big-jepa-brain
+    uv run python test_generate.py --run big-jepa-brain --quiet  # Summary only
+
+Interpretation:
+    - PASS: Coherent output, no major issues
+    - WARN: Has issues (repetition, too short, etc.)
+    - FAIL: Error occurred
+
+Common Issues Detected:
+    - Repetition loops ("the the the"): Reduce temperature, increase rep penalty
+    - Very short outputs: BOS token issue, train longer
+    - All periods ("....."): Posterior collapse, train probe more
+    - Random words: Top-K too high, or brain didn't learn
 """
 
 import argparse
+from collections import Counter
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 import tiktoken
-from pathlib import Path
-from collections import Counter
 
 from nanojepa.model import NanoJEPA, JEPAConfig
 
-# Test prompts covering different scenarios
+
+# Diverse test prompts covering different scenarios
 TEST_PROMPTS = [
     # Standard story starters
     "Once upon a time",
@@ -51,8 +65,9 @@ TEST_PROMPTS = [
     "When the sun came up",
 ]
 
-def load_model(run_name, model_file):
-    """Load the trained model."""
+
+def load_model(run_name: str, model_file: str):
+    """Load a trained NanoJEPA model."""
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     
     path = Path("runs") / run_name / model_file
@@ -85,7 +100,9 @@ def load_model(run_name, model_file):
     return model, device
 
 
-def generate_one(model, prompt, device, max_tokens=30, temperature=0.7, top_k=50, rep_penalty=1.5):
+def generate_one(model: NanoJEPA, prompt: str, device: str,
+                 max_tokens: int = 30, temperature: float = 0.7,
+                 top_k: int = 50, rep_penalty: float = 1.5) -> str:
     """Generate text from a single prompt."""
     tokenizer = tiktoken.get_encoding("gpt2")
     tokens = tokenizer.encode(prompt)
@@ -134,8 +151,17 @@ def generate_one(model, prompt, device, max_tokens=30, temperature=0.7, top_k=50
     return tokenizer.decode(generated_tokens)
 
 
-def analyze_output(text):
-    """Analyze generated text for quality metrics."""
+def analyze_output(text: str) -> dict:
+    """
+    Analyze generated text for quality issues.
+    
+    Returns dict with:
+        - length: word count
+        - unique_words: count of distinct words
+        - has_punctuation: contains sentence-ending punctuation
+        - has_repetition: same word 3+ times in a row
+        - is_coherent: passes basic coherence checks
+    """
     words = text.split()
     
     metrics = {
@@ -152,7 +178,7 @@ def analyze_output(text):
             metrics["has_repetition"] = True
             break
     
-    # Check for character spam
+    # Check for character spam (e.g., "........")
     if len(text) > 0:
         char_counts = Counter(text)
         most_common_char, count = char_counts.most_common(1)[0]
@@ -166,7 +192,7 @@ def analyze_output(text):
     return metrics
 
 
-def run_tests(model, device, verbose=True):
+def run_tests(model: NanoJEPA, device: str, verbose: bool = True) -> list:
     """Run all test prompts and analyze results."""
     results = []
     
@@ -179,21 +205,25 @@ def run_tests(model, device, verbose=True):
             output = generate_one(model, prompt, device)
             metrics = analyze_output(output)
             
+            status = "PASS" if metrics["is_coherent"] and not metrics["has_repetition"] else "WARN"
+            
             result = {
                 "prompt": prompt,
                 "output": output,
                 "metrics": metrics,
-                "status": "PASS" if metrics["is_coherent"] and not metrics["has_repetition"] else "WARN"
+                "status": status
             }
             
             if verbose:
-                status_icon = "✓" if result["status"] == "PASS" else "⚠"
+                status_icon = "✓" if status == "PASS" else "⚠"
                 print(f"\n[{i}/{len(TEST_PROMPTS)}] {status_icon} {prompt}")
-                print(f"    → {output[:100]}{'...' if len(output) > 100 else ''}")
-                if result["status"] == "WARN":
+                print(f"    → {output}")
+                if status == "WARN":
                     issues = []
-                    if metrics["has_repetition"]: issues.append("repetition")
-                    if not metrics["is_coherent"]: issues.append("incoherent")
+                    if metrics["has_repetition"]:
+                        issues.append("repetition")
+                    if not metrics["is_coherent"]:
+                        issues.append("incoherent")
                     print(f"    ⚠ Issues: {', '.join(issues)}")
             
             results.append(result)
@@ -213,8 +243,8 @@ def run_tests(model, device, verbose=True):
     return results
 
 
-def print_summary(results):
-    """Print summary statistics."""
+def print_summary(results: list):
+    """Print summary statistics and diagnosis."""
     print("\n" + "="*70)
     print("SUMMARY")
     print("="*70)
@@ -226,7 +256,7 @@ def print_summary(results):
     
     print(f"\nResults: {passed}/{total} PASS, {warned} WARN, {failed} FAIL")
     
-    # Aggregate metrics
+    # Aggregate metrics from coherent outputs
     coherent_results = [r for r in results if r["metrics"].get("is_coherent", False)]
     if coherent_results:
         avg_length = sum(r["metrics"]["length"] for r in coherent_results) / len(coherent_results)
@@ -249,7 +279,7 @@ def print_summary(results):
         print("✗ Model is struggling.")
         print("  Possible issues:")
         
-        # Check for specific problems
+        # Detect specific problems
         all_outputs = " ".join(r["output"] for r in results)
         
         if all_outputs.count(".") > len(all_outputs) * 0.3:
@@ -272,11 +302,16 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Only show summary")
     args = parser.parse_args()
     
-    model, device = load_model(args.run, args.model_file)
+    try:
+        model, device = load_model(args.run, args.model_file)
+    except FileNotFoundError as e:
+        print(f"\n✗ {e}")
+        print("\nMake sure you've run train_probe.py to create probed_model.pt")
+        return
+    
     results = run_tests(model, device, verbose=not args.quiet)
     print_summary(results)
 
 
 if __name__ == "__main__":
     main()
-
