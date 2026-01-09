@@ -1,17 +1,41 @@
-import os
-import re
+"""
+Data utilities for NanoJEPA.
+
+Provides modular functions for:
+- Downloading data
+- Tokenizing text
+- Splitting into stories
+- Creating training chunks
+- Block masking
+"""
+
 import urllib.request
 from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import tiktoken
 import torch
 from torch.utils.data import Dataset, DataLoader
-import tiktoken
 
-# Use the validation set (~19MB) as our "nano" training set
+# Constants
 DATA_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-valid.txt"
 DATA_DIR = Path(__file__).parent.parent / "data"
+EOT_TOKEN = 50256  # GPT-2 <|endoftext|>
 
-def download_tinystories() -> str:
-    """Download TinyStories-valid.txt if not present."""
+# Global tokenizer (lazy loaded)
+_TOKENIZER = None
+
+def get_tokenizer():
+    """Get the GPT-2 tokenizer (cached)."""
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        _TOKENIZER = tiktoken.get_encoding("gpt2")
+    return _TOKENIZER
+
+
+def download_tinystories() -> Path:
+    """Download TinyStories if not present. Returns filepath."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     filepath = DATA_DIR / "TinyStories-valid.txt"
 
@@ -23,105 +47,159 @@ def download_tinystories() -> str:
         urllib.request.urlretrieve(DATA_URL, filepath)
         print("Done.")
 
-    return str(filepath)
+    return filepath
 
-class SentenceJEPADataset(Dataset):
+
+def load_text(filepath: Path) -> str:
+    """Load raw text from file."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def tokenize(text: str) -> List[int]:
+    """Tokenize text using GPT-2 tokenizer."""
+    tokenizer = get_tokenizer()
+    return tokenizer.encode(text, allowed_special={'<|endoftext|>'})
+
+
+def decode(tokens: List[int]) -> str:
+    """Decode tokens back to text."""
+    tokenizer = get_tokenizer()
+    if isinstance(tokens, torch.Tensor):
+        tokens = tokens.tolist()
+    return tokenizer.decode(tokens)
+
+
+def split_into_stories(tokens: List[int], min_length: int = 64) -> List[List[int]]:
     """
-    Dataset that respects sentence boundaries.
+    Split token stream into individual stories using EOT token.
     
-    Structure:
-    - Context: N sentences
-    - Target:  Next N sentences
+    Returns list of stories, each story is a list of token IDs.
+    Only returns stories with at least min_length tokens.
     """
-    def __init__(self, text_data: str, tokenizer, block_size: int = 128, sentences_per_block: int = 3):
-        self.tokenizer = tokenizer
-        self.block_size = block_size
-        
-        # 1. Clean and Split by Sentence
-        # Split by .!? followed by whitespace
-        raw_sentences = re.split(r'(?<=[.!?])\s+', text_data)
-        self.sentences = [s.strip() for s in raw_sentences if len(s.strip()) > 10]
-        
-        print(f"Found {len(self.sentences)} sentences.")
-        
-        # 2. Create Samples (Sliding window of Sentences)
-        self.samples = []
-        N = sentences_per_block
-        
-        # Stride of 1 sentence
-        for i in range(0, len(self.sentences) - 2*N, 1):
-             ctx_text = " ".join(self.sentences[i : i+N])
-             tgt_text = " ".join(self.sentences[i+N : i+2*N])
-             self.samples.append((ctx_text, tgt_text))
-             
-        print(f"Created {len(self.samples)} context-target pairs.")
+    stories = []
+    current_story = []
+    
+    for token in tokens:
+        if token == EOT_TOKEN:
+            if len(current_story) >= min_length:
+                stories.append(current_story)
+            current_story = []
+        else:
+            current_story.append(token)
+    
+    # Handle last story if it doesn't end with EOT
+    if len(current_story) >= min_length:
+        stories.append(current_story)
+    
+    return stories
+
+
+def create_chunks(stories: List[List[int]], block_size: int = 128, stride: int = None) -> List[np.ndarray]:
+    """
+    Create fixed-size chunks from stories.
+    
+    Each chunk is guaranteed to be from a single story.
+    Uses sliding window with given stride (default: block_size // 2).
+    """
+    if stride is None:
+        stride = block_size // 2
+    
+    chunks = []
+    for story in stories:
+        if len(story) >= block_size:
+            for start in range(0, len(story) - block_size + 1, stride):
+                chunk = np.array(story[start : start + block_size], dtype=np.int64)
+                chunks.append(chunk)
+    
+    return chunks
+
+
+def create_random_mask(seq_len: int, mask_ratio: float = 0.3, min_mask_len: int = 8) -> Tuple[torch.Tensor, int, int]:
+    """
+    Create a random contiguous block mask.
+    
+    Returns:
+        mask: Boolean tensor [seq_len], True = masked
+        mask_start: Start index of mask
+        mask_end: End index of mask (exclusive)
+    """
+    mask_len = max(min_mask_len, int(seq_len * mask_ratio))
+    
+    # Random start position
+    max_start = seq_len - mask_len
+    mask_start = torch.randint(0, max_start + 1, (1,)).item()
+    mask_end = mask_start + mask_len
+    
+    mask = torch.zeros(seq_len, dtype=torch.bool)
+    mask[mask_start:mask_end] = True
+    
+    return mask, mask_start, mask_end
+
+
+# --- Dataset Class ---
+
+class StoryDataset(Dataset):
+    """Simple dataset wrapping pre-computed chunks."""
+    
+    def __init__(self, chunks: List[np.ndarray]):
+        self.chunks = chunks
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.chunks)
 
     def __getitem__(self, idx):
-        ctx_text, tgt_text = self.samples[idx]
-        
-        # Tokenize
-        ctx_tokens = self.tokenizer.encode(ctx_text, allowed_special={'<|endoftext|>'})
-        tgt_tokens = self.tokenizer.encode(tgt_text, allowed_special={'<|endoftext|>'})
-        
-        # === THE FIX: Add Start Token to Target ===
-        # We prepend 50256 to the target so the model learns:
-        # 50256 (Start) -> First Word
-        tgt_tokens = [50256] + tgt_tokens 
-        
-        # Pad / Truncate
-        ctx_tensor = self._pad_truncate(ctx_tokens)
-        tgt_tensor = self._pad_truncate(tgt_tokens)
-        
-        return ctx_tensor, tgt_tensor
+        return torch.from_numpy(self.chunks[idx])
 
-    def _pad_truncate(self, tokens):
-        if len(tokens) > self.block_size:
-            return torch.tensor(tokens[:self.block_size], dtype=torch.long)
-        else:
-            # Using 50256 (eot) as padding token
-            padding = [50256] * (self.block_size - len(tokens))
-            return torch.tensor(tokens + padding, dtype=torch.long)
+
+# --- Main Entry Point ---
 
 def get_dataloaders(
     block_size: int = 128,
-    batch_size: int = 32,
+    batch_size: int = 64,
     train_split: float = 0.9,
-    stride: int = 64, # Ignored now
-    subset_ratio: float = 0.1,
-    sentences_per_block: int = 1,
     max_samples: int = None,
     num_workers: int = 0,
-) -> tuple[DataLoader, DataLoader]:
+    **kwargs,
+) -> Tuple[DataLoader, DataLoader]:
     """
-    Get train and validation dataloaders for TinyStories.
+    Get train and validation dataloaders.
+    
+    Uses all the utility functions above.
     """
+    # 1. Download
     filepath = download_tinystories()
-    with open(filepath, "r", encoding="utf-8") as f:
-        full_text = f.read()
-        
-    # Take subset of TEXT first
-    split_char = int(len(full_text) * subset_ratio)
-    text_subset = full_text[:split_char]
     
-    tokenizer = tiktoken.get_encoding("gpt2")
+    # 2. Load & Tokenize
+    print("Loading and tokenizing...")
+    text = load_text(filepath)
+    tokens = tokenize(text)
+    print(f"Total tokens: {len(tokens):,}")
     
-    # Create Full Dataset
-    dataset = SentenceJEPADataset(text_subset, tokenizer, block_size, sentences_per_block)
+    # 3. Split into stories
+    print("Splitting into stories...")
+    stories = split_into_stories(tokens, min_length=block_size)
+    print(f"Found {len(stories)} stories (>= {block_size} tokens)")
     
+    # 4. Limit if requested
     if max_samples:
-        print(f"Limiting dataset to {max_samples} samples.")
-        indices = torch.randperm(len(dataset))[:max_samples]
-        dataset = torch.utils.data.Subset(dataset, indices)
+        max_stories = max(1, max_samples // 2)  # ~2 chunks per story
+        stories = stories[:max_stories]
+        print(f"Limited to {len(stories)} stories")
     
-    # Split
-    train_size = int(train_split * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # 5. Split stories into train/val
+    split_idx = int(len(stories) * train_split)
+    train_stories = stories[:split_idx]
+    val_stories = stories[split_idx:]
     
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    # 6. Create chunks
+    train_chunks = create_chunks(train_stories, block_size)
+    val_chunks = create_chunks(val_stories, block_size)
+    print(f"Train chunks: {len(train_chunks):,}, Val chunks: {len(val_chunks):,}")
+    
+    # 7. Create datasets and loaders
+    train_dataset = StoryDataset(train_chunks)
+    val_dataset = StoryDataset(val_chunks)
     
     train_loader = DataLoader(
         train_dataset,
@@ -140,25 +218,46 @@ def get_dataloaders(
 
     return train_loader, val_loader
 
-# --- Debug Tool ---
+
+# --- Debug ---
 if __name__ == "__main__":
-    # Quick test to verify data loading
-    print("Running Data Debug...")
-    train_loader, _ = get_dataloaders(subset_ratio=0.01, batch_size=2)
+    print("="*60)
+    print("DATA UTILITIES DEBUG")
+    print("="*60)
     
-    tokenizer = tiktoken.get_encoding("gpt2")
+    # Test each function
+    filepath = download_tinystories()
+    print(f"\n1. Downloaded: {filepath}")
     
-    print("\n--- Sample Batch ---")
-    for ctx, tgt in train_loader:
-        print(f"Context Shape: {ctx.shape}")
-        print(f"Target Shape: {tgt.shape}")
+    text = load_text(filepath)
+    print(f"2. Loaded text: {len(text):,} chars")
+    
+    tokens = tokenize(text[:10000])  # Just first 10k chars for speed
+    print(f"3. Tokenized: {len(tokens)} tokens")
+    print(f"   Sample: {decode(tokens[:20])}...")
+    
+    stories = split_into_stories(tokens, min_length=32)
+    print(f"4. Split into {len(stories)} stories")
+    if stories:
+        print(f"   First story: {decode(stories[0][:30])}...")
+    
+    chunks = create_chunks(stories, block_size=64)
+    print(f"5. Created {len(chunks)} chunks")
+    
+    # Test masking
+    mask, start, end = create_random_mask(64, mask_ratio=0.3)
+    print(f"\n6. Random mask: positions {start} to {end} ({mask.sum().item()} tokens)")
+    print(f"   Mask: {mask.int().tolist()[:20]}...")
+    
+    # Visual demo of masking
+    if chunks:
+        sample = chunks[0]
+        text_before = decode(sample)
         
-        print("\n[Sample 1]")
-        # Decode and manually strip padding token (50256) which often renders as <|endoftext|>
-        ctx_tokens = [t for t in ctx[0].tolist() if t != 50256]
-        tgt_tokens = [t for t in tgt[0].tolist() if t != 50256]
+        masked_sample = sample.copy()
+        masked_sample[start:end] = EOT_TOKEN  # Replace with EOT for visualization
+        text_after = decode(masked_sample)
         
-        print("Context:", tokenizer.decode(ctx_tokens))
-        print("-" * 20)
-        print("Target:", tokenizer.decode(tgt_tokens))
-        break
+        print(f"\n7. Masking demo:")
+        print(f"   Original: {text_before[:100]}...")
+        print(f"   Masked:   {text_after[:100]}...")

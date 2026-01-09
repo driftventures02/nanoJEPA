@@ -1,161 +1,207 @@
-import torch
-import torch.nn.functional as F
-import tiktoken
+"""
+Generate text using trained JEPA brain + decoder probe.
+"""
+
 import argparse
 from pathlib import Path
-from nanojepa.model import NanoJEPA, JEPAConfig
 
-# Setup device
-device = "mps" if torch.backends.mps.is_available() else "cpu"
-tokenizer = tiktoken.get_encoding("gpt2")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def load_model(run_name, model_file="best_model.pt"):
-    """Loads the best model from a specific training run."""
-    # 1. Find the checkpoint
-    path = Path("runs") / run_name / model_file
-    if not path.exists():
-        raise FileNotFoundError(f"Could not find model at {path}")
-    
-    print(f"Loading {path}...")
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    saved_config = checkpoint["config"]
-    
-    # 2. Rebuild the exact architecture from the config
-    if isinstance(saved_config, JEPAConfig):
-        config = saved_config
-        config.encoder_only = False # Force decoder creation
-    else:
-        # It's a dict
-        config = JEPAConfig(
-            vocab_size=saved_config.get("vocab_size", 50257),
-            embed_dim=saved_config["embed_dim"],
-            enc_layers=saved_config["enc_layers"],
-            enc_heads=saved_config["enc_heads"],
-            pred_depth=saved_config["pred_depth"],
-            block_size=saved_config["block_size"],
-            dropout=saved_config["dropout"],
-            encoder_only=False 
-        )
-    
-    model = NanoJEPA(config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return model
+from .model import NanoJEPA, JEPAConfig
+from .train_probe import Decoder
+from .data import get_tokenizer
 
-def generate(model, prompt, max_new_tokens=50):
+
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def load_models(brain_run: str, decoder_run: str = None):
+    """Load JEPA brain and decoder."""
+    device = get_device()
+    
+    # Load brain
+    brain_path = Path("runs") / brain_run / "best_model.pt"
+    print(f"Loading brain from {brain_path}...")
+    brain_checkpoint = torch.load(brain_path, map_location=device, weights_only=False)
+    brain_config = brain_checkpoint["config"]
+    
+    jepa_config = JEPAConfig(
+        vocab_size=brain_config["vocab_size"],
+        embed_dim=brain_config["embed_dim"],
+        enc_layers=brain_config["enc_layers"],
+        enc_heads=brain_config["enc_heads"],
+        pred_depth=brain_config["pred_depth"],
+        block_size=brain_config["block_size"],
+        dropout=brain_config["dropout"],
+        mask_ratio=brain_config["mask_ratio"],
+    )
+    brain = NanoJEPA(jepa_config).to(device)
+    brain.load_state_dict(brain_checkpoint["model_state_dict"])
+    brain.eval()
+    
+    # Load decoder
+    decoder_run = decoder_run or f"probe-{brain_run}"
+    decoder_path = Path("runs") / decoder_run / "decoder.pt"
+    print(f"Loading decoder from {decoder_path}...")
+    decoder_checkpoint = torch.load(decoder_path, map_location=device, weights_only=False)
+    
+    decoder = Decoder(
+        vocab_size=brain_config["vocab_size"],
+        embed_dim=brain_config["embed_dim"],
+        num_layers=4,
+        num_heads=brain_config["enc_heads"],
+        dropout=0.0,  # No dropout for inference
+        max_len=brain_config["block_size"]
+    ).to(device)
+    decoder.load_state_dict(decoder_checkpoint["decoder_state_dict"])
+    decoder.eval()
+    
+    return brain, decoder, brain_config, device
+
+
+def generate(
+    brain: NanoJEPA,
+    decoder: Decoder,
+    prompt: str,
+    device: torch.device,
+    block_size: int = 128,
+    max_new_tokens: int = 100,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    repetition_penalty: float = 1.2,
+):
     """
-    1. Encodes the prompt into a Context Vector.
-    2. Predicts the Future Thought Vector.
-    3. Decodes that Future Vector into text.
-    """
-    # A. Encode the Prompt (Context)
-    # Note: We need to pad to block_size because our model expects it due to Positional Embeddings
-    # But for a simple test, we'll just feed the raw tokens and let the model handle it 
-    # (our masking logic in encode_student handles variable lengths well enough if not batched awkwardly)
-    tokens = tokenizer.encode(prompt)
-    ctx_idx = torch.tensor([tokens], dtype=torch.long).to(device)
+    Generate text from a prompt.
     
-    print(f"\nPrompt: {prompt}")
+    The key insight: JEPA is trained to predict MASKED regions.
+    So we must give it: [prompt tokens] + [MASK MASK MASK ...]
+    Then the brain PREDICTS what goes in those mask slots.
+    The decoder translates those predictions to text.
+    """
+    tokenizer = get_tokenizer()
+    prompt_tokens = tokenizer.encode(prompt)
+    prompt_len = len(prompt_tokens)
+    
+    # Build input: [prompt] + [MASK tokens for the rest]
+    # The MASK positions are where the brain will PREDICT
+    num_masks = block_size - prompt_len
+    if num_masks <= 0:
+        # Prompt is too long, truncate
+        prompt_tokens = prompt_tokens[:block_size // 2]
+        prompt_len = len(prompt_tokens)
+        num_masks = block_size - prompt_len
+    
+    # Create input tensor (we'll replace mask positions with mask_token embedding later)
+    # For now, use dummy tokens - the model.forward will handle masking
+    x = torch.tensor([prompt_tokens + [0] * num_masks], dtype=torch.long, device=device)
+    
+    # Create mask: True for positions we want to predict (after prompt)
+    mask = torch.zeros(1, block_size, dtype=torch.bool, device=device)
+    mask[0, prompt_len:] = True  # Mask everything after the prompt
     
     with torch.no_grad():
-        # B. THE JEPA STEP: Predict the abstract future
-        # 1. Get current thought
-        z_current = model.encode_student(ctx_idx)
-        # 2. Predict future thought
-        z_future = model.predictor(z_current)
+        # Encode with masking
+        # We need to manually apply the mask token
+        B, T = x.shape
+        pos = torch.arange(T, dtype=torch.long, device=device)
         
-        print(f"Thinking... (Predicted Vector Norm: {z_future.norm().item():.2f})")
-        print("-" * 40)
-        print("Prediction: ", end="", flush=True)
-
-        # C. THE DECODER STEP: Translate vector to words
-        # We start with an empty sequence. The decoder will rely purely on z_future initially.
-        # However, TransformerDecoder needs a 'tgt' input (what has been generated so far).
-        # We usually start with a Start Token. GPT-2 doesn't have a specific BOS, so we can use EOT (50256)
-        # or just start with the first generated token being implied.
+        # Get embeddings
+        emb = brain.embedding(x) + brain.pos_embedding(pos)
         
-        # We'll use EOT (50256) as the start token.
-        curr_seq = torch.tensor([[50256]], dtype=torch.long).to(device)
+        # Replace masked positions with the learnable mask token
+        mask_expanded = mask.unsqueeze(-1)  # [1, T, 1]
+        mask_tokens = brain.mask_token.expand(B, T, -1)
+        emb = torch.where(mask_expanded, mask_tokens, emb)
         
-        # We need to expand the thought vector to match the decoder's expected input
-        # The decoder treats this as the "Memory" (like the output of an encoder in a std transformer)
-        memory = z_future.unsqueeze(1) # Shape: [1, 1, embed_dim]
-
+        # Encode through student encoder
+        z = brain.student_encoder(emb)
+        z = brain.student_norm(z)
+        
+        # Predict (this is where the magic happens!)
+        z_pred = brain.predictor(z)
+        z_pred = brain.predictor_norm(z_pred)
+        
+        # The z_pred now contains:
+        # - Encoded vectors for prompt positions
+        # - PREDICTED vectors for mask positions (the future!)
+        
+        print(f"Prompt: {prompt_len} tokens, Predicting: {num_masks} future vectors")
+        
+        # Start generation using the predicted vectors as memory
+        generated = [50256]  # BOS token
+        
         for _ in range(max_new_tokens):
-            # 1. Prepare input for decoder
-            dec_input = curr_seq
-
-            # 2. Masking (Standard Causal Mask for auto-regressive generation)
-            tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(dec_input.shape[1]).to(device)
+            # Decoder input
+            dec_input = torch.tensor([generated], dtype=torch.long, device=device)
+            logits = decoder(dec_input, memory=z_pred)
             
-            # 3. Run Decoder
-            # It tries to predict the next token based on 'dec_input' (what we said so far)
-            # AND 'memory' (the JEPA's predicted thought vector)
-            # Note: We need to create embeddings for dec_input inside the model usually, 
-            # but our model.decoder expects embeddings + pos_encodings.
+            # Get logits for last position
+            next_logits = logits[0, -1, :].clone()
             
-            # Wait, model.decoder expects TENSOR inputs (embeddings), not token indices?
-            # Let's check model.py... 
-            # forward() does: tgt_emb = self.embedding(target_idx) + self.pos_embedding(...)
-            # So we need to do that manually here since we are calling model.decoder directly.
+            # Repetition penalty
+            for token_id in set(generated):
+                next_logits[token_id] /= repetition_penalty
             
-            T_tgt = dec_input.shape[1]
-            pos_tgt = torch.arange(0, T_tgt, dtype=torch.long, device=device)
-            tgt_emb = model.embedding(dec_input) + model.pos_embedding(pos_tgt)
+            # Temperature
+            next_logits = next_logits / temperature
             
-            dec_out = model.decoder(tgt=tgt_emb, memory=memory, tgt_mask=tgt_mask)
+            # Top-K filtering
+            if top_k > 0:
+                values, _ = torch.topk(next_logits, top_k)
+                min_value = values[-1]
+                next_logits[next_logits < min_value] = float('-inf')
             
-            # 4. Project to Vocabulary
-            logits = model.lm_head(dec_out)
-            next_token_logits = logits[:, -1, :] 
-
-            # 2. Strict Repetition Penalty (Kill the "and and and" and "needs needs")
-            for token_id in set(curr_seq[0].tolist()):
-                count = (curr_seq[0] == token_id).sum().item()
-                if count > 0:
-                    # Using subtraction for robust penalty (works for negative logits too)
-                    # User suggested division, but subtraction is safer:
-                    next_token_logits[0, token_id] -= 1.5
-
-            # 3. Temperature (0.7 is the sweet spot for coherence)
-            temperature = 0.7
-            scaled_logits = next_token_logits / temperature
-
-            # --- CRITICAL FIX: Top-K Filtering ---
-            # This deletes the weird words like "coursepen" or "thankedaters"
-            # It forces the model to pick from the top 50 valid words.
-            top_k = 50
-            v, _ = torch.topk(scaled_logits, top_k)
-            scaled_logits[scaled_logits < v[:, [-1]]] = -float('Inf')
-            # -------------------------------------
-
-            # 4. Sample
-            probs = F.softmax(scaled_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            # Sample
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probs, 1).item()
             
-            # 6. Stop if we hit EOT (and it's not the very first start token we forced)
-            if next_token.item() == 50256:
-                print(" <EOT>", end="")
+            if next_token == 50256:  # EOT
                 break
-                
-            # 7. Print and Append
-            word = tokenizer.decode([next_token.item()])
-            print(word, end="", flush=True)
             
-            curr_seq = torch.cat([curr_seq, next_token], dim=1)
-            
-        print("\n" + "-" * 40)
+            generated.append(next_token)
+    
+    # Decode (skip BOS)
+    output = tokenizer.decode(generated[1:])
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate text with JEPA")
+    parser.add_argument("--brain-run", type=str, required=True, help="JEPA brain run name")
+    parser.add_argument("--decoder-run", type=str, default=None, help="Decoder run name (default: probe-{brain-run})")
+    parser.add_argument("--prompt", type=str, default="Once upon a time", help="Prompt text")
+    parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--top-k", type=int, default=50, help="Top-K sampling")
+    parser.add_argument("--repetition-penalty", type=float, default=1.2, help="Repetition penalty")
+    args = parser.parse_args()
+    
+    brain, decoder, config, device = load_models(args.brain_run, args.decoder_run)
+    
+    print(f"\nPrompt: {args.prompt}")
+    print("-" * 50)
+    
+    output = generate(
+        brain=brain,
+        decoder=decoder,
+        prompt=args.prompt,
+        device=device,
+        block_size=config["block_size"],
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+    )
+    
+    print(f"\nGenerated:\n{output}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run", type=str, required=True, help="Name of the folder in 'runs/' (e.g. tiny-test-layernorm)")
-    parser.add_argument("--model-file", type=str, default="best_model.pt", help="Filename of the model checkpoint (e.g. probed_model.pt)")
-    parser.add_argument("--text", type=str, default="Once upon a time", help="The start of the story")
-    args = parser.parse_args()
-
-    try:
-        model = load_model(args.run, args.model_file)
-        generate(model, args.text)
-    except Exception as e:
-        print(f"\nError: {e}")
-
+    main()
